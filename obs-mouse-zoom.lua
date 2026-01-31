@@ -7,10 +7,13 @@
 
 local obs = obslua
 local ffi = require("ffi")
-local VERSION = "3.2"
+local VERSION = "4.0"
 local CROP_FILTER_NAME = "obs-mouse-zoom-crop"
 local VIGNETTE_FILTER_NAME = "obs-mouse-zoom-vignette"
 local SPOTLIGHT_SOURCE_NAME = "obs-mouse-spotlight"
+local PIP_SOURCE_PREFIX = "obs-mouse-pip-"
+local PIP_BORDER_PREFIX = "obs-mouse-pip-border-"
+local PIP_MAX_WINDOWS = 3
 
 -- State variables
 local source_name = ""
@@ -128,6 +131,83 @@ local ZoomState = {
     ZoomedIn = 3,
 }
 local zoom_state = ZoomState.None
+
+-- Picture-in-Picture (PiP) system
+local PiPMode = {
+    FollowMouse = 1,    -- Real-time follow mouse position
+    FixedRegion = 2,    -- Monitor a fixed region
+    Locked = 3,         -- Locked at current mouse position
+}
+
+local PiPPosition = {
+    TopLeft = 1,
+    TopCenter = 2,
+    TopRight = 3,
+    MiddleLeft = 4,
+    MiddleRight = 5,
+    BottomLeft = 6,
+    BottomCenter = 7,
+    BottomRight = 8,
+    Custom = 9,
+}
+
+-- PiP settings
+local use_pip = false
+local pip_windows = {}  -- Array of PiP window configurations
+
+-- Default PiP window configuration template
+local function create_default_pip_config(id)
+    return {
+        id = id,
+        enabled = false,
+        mode = PiPMode.FollowMouse,
+
+        -- Source region (area to magnify)
+        source_x = 0,
+        source_y = 0,
+        source_width = 400,
+        source_height = 300,
+
+        -- Display settings
+        display_position = PiPPosition.TopRight,
+        display_x = 0,          -- Custom position X
+        display_y = 0,          -- Custom position Y
+        display_width = 320,
+        display_height = 240,
+        zoom_factor = 2.5,
+
+        -- Style settings
+        border_enabled = true,
+        border_width = 3,
+        corner_radius = 8,
+        opacity = 1.0,
+
+        -- Animation settings
+        smooth_follow = true,
+        follow_speed = 0.15,
+
+        -- Runtime state (not saved)
+        source = nil,
+        sceneitem = nil,
+        crop_filter = nil,
+        crop_settings = nil,
+        border_source = nil,
+        border_sceneitem = nil,
+        current_crop = { x = 0, y = 0, w = 0, h = 0 },
+        target_crop = { x = 0, y = 0, w = 0, h = 0 },
+        is_visible = false,
+    }
+end
+
+-- Initialize pip_windows array
+for i = 1, PIP_MAX_WINDOWS do
+    pip_windows[i] = create_default_pip_config(i)
+end
+
+-- PiP hotkeys
+local pip_hotkey_toggle = {}    -- Toggle visibility for each window
+local pip_hotkey_lock = {}      -- Lock position for each window
+local pip_hotkey_all = nil      -- Toggle all windows
 
 -- OBS version detection
 local version = obs.obs_get_version_string()
@@ -1195,6 +1275,535 @@ function remove_magnifier()
 end
 
 ---
+-- ============================================================================
+-- Picture-in-Picture (PiP) System
+-- ============================================================================
+
+---
+-- Calculate preset position coordinates based on canvas size
+function get_pip_preset_position(preset, window_width, window_height)
+    local video_info = obs.obs_video_info()
+    obs.obs_get_video_info(video_info)
+    local canvas_w = video_info.base_width
+    local canvas_h = video_info.base_height
+    local margin = 20
+
+    local positions = {
+        [PiPPosition.TopLeft] = { x = margin, y = margin },
+        [PiPPosition.TopCenter] = { x = (canvas_w - window_width) / 2, y = margin },
+        [PiPPosition.TopRight] = { x = canvas_w - window_width - margin, y = margin },
+        [PiPPosition.MiddleLeft] = { x = margin, y = (canvas_h - window_height) / 2 },
+        [PiPPosition.MiddleRight] = { x = canvas_w - window_width - margin, y = (canvas_h - window_height) / 2 },
+        [PiPPosition.BottomLeft] = { x = margin, y = canvas_h - window_height - margin },
+        [PiPPosition.BottomCenter] = { x = (canvas_w - window_width) / 2, y = canvas_h - window_height - margin },
+        [PiPPosition.BottomRight] = { x = canvas_w - window_width - margin, y = canvas_h - window_height - margin },
+    }
+
+    return positions[preset] or { x = margin, y = margin }
+end
+
+---
+-- Generate a border frame TGA image for PiP window
+function generate_pip_border_tga(filepath, width, height, border_width, corner_radius)
+    local file = io.open(filepath, "wb")
+    if not file then
+        log("ERROR: Failed to create PiP border TGA file: " .. filepath)
+        return false
+    end
+
+    -- TGA Header (18 bytes)
+    local header = string.char(
+        0,          -- ID length
+        0,          -- Color map type (none)
+        2,          -- Image type (uncompressed true-color)
+        0, 0,       -- Color map origin
+        0, 0,       -- Color map length
+        0,          -- Color map depth
+        0, 0,       -- X origin
+        0, 0,       -- Y origin
+        width % 256, math.floor(width / 256),   -- Width (little-endian)
+        height % 256, math.floor(height / 256), -- Height (little-endian)
+        32,         -- Bits per pixel (BGRA)
+        0x28        -- Image descriptor (top-left origin, 8 alpha bits)
+    )
+    file:write(header)
+
+    -- Generate pixel data (BGRA format) - white border with rounded corners
+    for y = 0, height - 1 do
+        for x = 0, width - 1 do
+            local is_border = false
+            local alpha = 0
+
+            -- Check if pixel is on the border
+            local on_left = x < border_width
+            local on_right = x >= width - border_width
+            local on_top = y < border_width
+            local on_bottom = y >= height - border_width
+
+            if on_left or on_right or on_top or on_bottom then
+                -- Check corner radius
+                local in_corner = false
+                local corner_dist = 0
+
+                -- Top-left corner
+                if x < corner_radius and y < corner_radius then
+                    corner_dist = math.sqrt((corner_radius - x)^2 + (corner_radius - y)^2)
+                    in_corner = corner_dist > corner_radius
+                -- Top-right corner
+                elseif x >= width - corner_radius and y < corner_radius then
+                    corner_dist = math.sqrt((x - (width - corner_radius - 1))^2 + (corner_radius - y)^2)
+                    in_corner = corner_dist > corner_radius
+                -- Bottom-left corner
+                elseif x < corner_radius and y >= height - corner_radius then
+                    corner_dist = math.sqrt((corner_radius - x)^2 + (y - (height - corner_radius - 1))^2)
+                    in_corner = corner_dist > corner_radius
+                -- Bottom-right corner
+                elseif x >= width - corner_radius and y >= height - corner_radius then
+                    corner_dist = math.sqrt((x - (width - corner_radius - 1))^2 + (y - (height - corner_radius - 1))^2)
+                    in_corner = corner_dist > corner_radius
+                end
+
+                if not in_corner then
+                    is_border = true
+                    alpha = 255
+                end
+            end
+
+            if is_border then
+                -- White border with full alpha
+                file:write(string.char(255, 255, 255, alpha))
+            else
+                -- Transparent
+                file:write(string.char(0, 0, 0, 0))
+            end
+        end
+    end
+
+    file:close()
+    log("PiP border TGA generated: " .. filepath)
+    return true
+end
+
+---
+-- Create a PiP window source and add to scene
+function create_pip_window(window)
+    if window.source ~= nil then
+        return -- Already exists
+    end
+
+    if source == nil then
+        log("ERROR: Cannot create PiP window - main source not available")
+        return
+    end
+
+    local window_id = window.id
+    local pip_source_name = PIP_SOURCE_PREFIX .. window_id
+
+    -- Clone the main source settings to create PiP source
+    local main_source_id = obs.obs_source_get_id(source)
+    local main_settings = obs.obs_source_get_settings(source)
+
+    window.source = obs.obs_source_create_private(main_source_id, pip_source_name, main_settings)
+    obs.obs_data_release(main_settings)
+
+    if window.source == nil then
+        log("ERROR: Failed to create PiP source " .. window_id)
+        return
+    end
+
+    -- Create crop filter for this PiP window
+    window.crop_settings = obs.obs_data_create()
+    obs.obs_data_set_bool(window.crop_settings, "relative", false)
+    window.crop_filter = obs.obs_source_create_private("crop_filter", pip_source_name .. "-crop", window.crop_settings)
+
+    if window.crop_filter then
+        obs.obs_source_filter_add(window.source, window.crop_filter)
+    end
+
+    log("PiP window " .. window_id .. " source created")
+end
+
+---
+-- Add PiP window to the current scene
+function add_pip_to_scene(window)
+    if window.source == nil or window.sceneitem ~= nil then
+        return
+    end
+
+    local scene_source = obs.obs_frontend_get_current_scene()
+    if scene_source == nil then
+        return
+    end
+
+    local scene = obs.obs_scene_from_source(scene_source)
+    if scene == nil then
+        obs.obs_source_release(scene_source)
+        return
+    end
+
+    -- Add PiP source to scene
+    window.sceneitem = obs.obs_scene_add(scene, window.source)
+
+    if window.sceneitem then
+        -- Calculate display position
+        local pos = { x = window.display_x, y = window.display_y }
+        if window.display_position ~= PiPPosition.Custom then
+            pos = get_pip_preset_position(window.display_position, window.display_width, window.display_height)
+        end
+
+        -- Calculate scale based on source region and display size
+        local scale_x = window.display_width / window.source_width
+        local scale_y = window.display_height / window.source_height
+
+        -- Set transform
+        local info = create_transform_info()
+        get_sceneitem_info(window.sceneitem, info)
+        info.pos.x = pos.x
+        info.pos.y = pos.y
+        info.scale.x = scale_x
+        info.scale.y = scale_y
+        info.bounds_type = obs.OBS_BOUNDS_SCALE_INNER
+        info.bounds.x = window.display_width
+        info.bounds.y = window.display_height
+        set_sceneitem_info(window.sceneitem, info)
+
+        -- Move to top
+        obs.obs_sceneitem_set_order(window.sceneitem, obs.OBS_ORDER_MOVE_TOP)
+        obs.obs_sceneitem_set_visible(window.sceneitem, false)
+
+        log("PiP window " .. window.id .. " added to scene at (" .. pos.x .. ", " .. pos.y .. ")")
+    end
+
+    -- Create and add border if enabled
+    if window.border_enabled then
+        create_pip_border(window)
+    end
+
+    obs.obs_source_release(scene_source)
+end
+
+---
+-- Create border overlay for PiP window
+function create_pip_border(window)
+    if window.border_source ~= nil then
+        return
+    end
+
+    local script_dir = get_script_path()
+    if not script_dir then
+        return
+    end
+
+    local border_path = script_dir .. "pip_border_" .. window.id .. ".tga"
+
+    -- Generate border TGA
+    if not generate_pip_border_tga(border_path,
+                                    math.floor(window.display_width),
+                                    math.floor(window.display_height),
+                                    window.border_width,
+                                    window.corner_radius) then
+        return
+    end
+
+    -- Create image source for border
+    local border_settings = obs.obs_data_create()
+    obs.obs_data_set_string(border_settings, "file", border_path)
+    window.border_source = obs.obs_source_create_private("image_source", PIP_BORDER_PREFIX .. window.id, border_settings)
+    obs.obs_data_release(border_settings)
+
+    if window.border_source == nil then
+        return
+    end
+
+    -- Add to scene
+    local scene_source = obs.obs_frontend_get_current_scene()
+    if scene_source then
+        local scene = obs.obs_scene_from_source(scene_source)
+        if scene then
+            window.border_sceneitem = obs.obs_scene_add(scene, window.border_source)
+
+            if window.border_sceneitem then
+                -- Position border at same location as PiP window
+                local pos = { x = window.display_x, y = window.display_y }
+                if window.display_position ~= PiPPosition.Custom then
+                    pos = get_pip_preset_position(window.display_position, window.display_width, window.display_height)
+                end
+
+                local border_pos = obs.vec2()
+                border_pos.x = pos.x
+                border_pos.y = pos.y
+                obs.obs_sceneitem_set_pos(window.border_sceneitem, border_pos)
+
+                obs.obs_sceneitem_set_order(window.border_sceneitem, obs.OBS_ORDER_MOVE_TOP)
+                obs.obs_sceneitem_set_visible(window.border_sceneitem, false)
+            end
+        end
+        obs.obs_source_release(scene_source)
+    end
+
+    log("PiP border " .. window.id .. " created")
+end
+
+---
+-- Update PiP window crop region based on mode
+function update_pip_crop(window)
+    if window.crop_filter == nil or window.crop_settings == nil then
+        return
+    end
+
+    local target = window.target_crop
+
+    if window.mode == PiPMode.FollowMouse then
+        -- Get mouse position in source coordinates
+        local mouse = get_mouse_pos()
+
+        -- Apply monitor offset and scaling
+        local monitor_x = (monitor_info and monitor_info.x) or 0
+        local monitor_y = (monitor_info and monitor_info.y) or 0
+        local sx = (monitor_info and monitor_info.scale_x) or 1
+        local sy = (monitor_info and monitor_info.scale_y) or 1
+
+        local source_mouse_x = (mouse.x - monitor_x) * sx
+        local source_mouse_y = (mouse.y - monitor_y) * sy
+
+        -- Center the source region on mouse
+        local half_w = window.source_width / 2
+        local half_h = window.source_height / 2
+
+        target.x = source_mouse_x - half_w
+        target.y = source_mouse_y - half_h
+        target.w = window.source_width
+        target.h = window.source_height
+
+        -- Clamp to source bounds
+        local max_x = (zoom_info.source_size.width or 1920) - window.source_width
+        local max_y = (zoom_info.source_size.height or 1080) - window.source_height
+        target.x = clamp(0, max_x, target.x)
+        target.y = clamp(0, max_y, target.y)
+
+    elseif window.mode == PiPMode.FixedRegion then
+        -- Use fixed source coordinates
+        target.x = window.source_x
+        target.y = window.source_y
+        target.w = window.source_width
+        target.h = window.source_height
+
+    elseif window.mode == PiPMode.Locked then
+        -- Keep current target (locked position)
+        target.w = window.source_width
+        target.h = window.source_height
+    end
+
+    -- Smooth interpolation
+    local current = window.current_crop
+    if window.smooth_follow and window.mode == PiPMode.FollowMouse then
+        current.x = lerp(current.x, target.x, window.follow_speed)
+        current.y = lerp(current.y, target.y, window.follow_speed)
+    else
+        current.x = target.x
+        current.y = target.y
+    end
+    current.w = target.w
+    current.h = target.h
+
+    -- Apply crop filter settings
+    obs.obs_data_set_int(window.crop_settings, "left", math.floor(current.x))
+    obs.obs_data_set_int(window.crop_settings, "top", math.floor(current.y))
+    obs.obs_data_set_int(window.crop_settings, "cx", math.floor(current.w))
+    obs.obs_data_set_int(window.crop_settings, "cy", math.floor(current.h))
+    obs.obs_source_update(window.crop_filter, window.crop_settings)
+end
+
+---
+-- Show a PiP window
+function show_pip_window(window)
+    if window.sceneitem == nil then
+        create_pip_window(window)
+        add_pip_to_scene(window)
+    end
+
+    if window.sceneitem then
+        obs.obs_sceneitem_set_visible(window.sceneitem, true)
+        window.is_visible = true
+    end
+
+    if window.border_sceneitem then
+        obs.obs_sceneitem_set_visible(window.border_sceneitem, true)
+    end
+
+    log("PiP window " .. window.id .. " shown")
+end
+
+---
+-- Hide a PiP window
+function hide_pip_window(window)
+    if window.sceneitem then
+        obs.obs_sceneitem_set_visible(window.sceneitem, false)
+        window.is_visible = false
+    end
+
+    if window.border_sceneitem then
+        obs.obs_sceneitem_set_visible(window.border_sceneitem, false)
+    end
+
+    log("PiP window " .. window.id .. " hidden")
+end
+
+---
+-- Remove a PiP window completely
+function remove_pip_window(window)
+    -- Remove border
+    if window.border_sceneitem then
+        obs.obs_sceneitem_remove(window.border_sceneitem)
+        window.border_sceneitem = nil
+    end
+
+    if window.border_source then
+        obs.obs_source_release(window.border_source)
+        window.border_source = nil
+    end
+
+    -- Remove crop filter
+    if window.crop_filter and window.source then
+        obs.obs_source_filter_remove(window.source, window.crop_filter)
+        obs.obs_source_release(window.crop_filter)
+        window.crop_filter = nil
+    end
+
+    if window.crop_settings then
+        obs.obs_data_release(window.crop_settings)
+        window.crop_settings = nil
+    end
+
+    -- Remove sceneitem
+    if window.sceneitem then
+        obs.obs_sceneitem_remove(window.sceneitem)
+        window.sceneitem = nil
+    end
+
+    -- Release source
+    if window.source then
+        obs.obs_source_release(window.source)
+        window.source = nil
+    end
+
+    window.is_visible = false
+    log("PiP window " .. window.id .. " removed")
+end
+
+---
+-- Show all enabled PiP windows
+function show_all_pip_windows()
+    if not use_pip then
+        return
+    end
+
+    for i = 1, PIP_MAX_WINDOWS do
+        local window = pip_windows[i]
+        if window.enabled then
+            show_pip_window(window)
+        end
+    end
+end
+
+---
+-- Hide all PiP windows
+function hide_all_pip_windows()
+    for i = 1, PIP_MAX_WINDOWS do
+        hide_pip_window(pip_windows[i])
+    end
+end
+
+---
+-- Remove all PiP windows
+function remove_all_pip_windows()
+    for i = 1, PIP_MAX_WINDOWS do
+        remove_pip_window(pip_windows[i])
+    end
+end
+
+---
+-- Update all visible PiP windows
+function update_all_pip_windows()
+    if not use_pip then
+        return
+    end
+
+    for i = 1, PIP_MAX_WINDOWS do
+        local window = pip_windows[i]
+        if window.enabled and window.is_visible then
+            update_pip_crop(window)
+        end
+    end
+end
+
+---
+-- Lock a PiP window at current mouse position
+function lock_pip_window(window)
+    if window.mode == PiPMode.FollowMouse then
+        window.mode = PiPMode.Locked
+        -- Current target becomes the locked position
+        window.target_crop.x = window.current_crop.x
+        window.target_crop.y = window.current_crop.y
+        log("PiP window " .. window.id .. " locked at (" .. window.target_crop.x .. ", " .. window.target_crop.y .. ")")
+    else
+        -- Unlock - return to follow mouse
+        window.mode = PiPMode.FollowMouse
+        log("PiP window " .. window.id .. " unlocked")
+    end
+end
+
+---
+-- Hotkey callback for toggling individual PiP window
+function create_pip_toggle_callback(window_id)
+    return function(pressed)
+        if pressed then
+            local window = pip_windows[window_id]
+            if window.is_visible then
+                hide_pip_window(window)
+            else
+                show_pip_window(window)
+            end
+        end
+    end
+end
+
+---
+-- Hotkey callback for locking individual PiP window
+function create_pip_lock_callback(window_id)
+    return function(pressed)
+        if pressed then
+            lock_pip_window(pip_windows[window_id])
+        end
+    end
+end
+
+---
+-- Hotkey callback for toggling all PiP windows
+function on_toggle_all_pip(pressed)
+    if pressed then
+        local any_visible = false
+        for i = 1, PIP_MAX_WINDOWS do
+            if pip_windows[i].is_visible then
+                any_visible = true
+                break
+            end
+        end
+
+        if any_visible then
+            hide_all_pip_windows()
+        else
+            show_all_pip_windows()
+        end
+    end
+end
+
+---
+-- ============================================================================
+-- End of PiP System
+-- ============================================================================
+
+---
 -- Get the size and position of the monitor
 function get_monitor_info(source_to_check)
     local info = nil
@@ -1693,6 +2302,10 @@ function on_toggle_zoom(pressed)
                 if use_magnifier_character then
                     start_magnifier_exit()
                 end
+                -- Hide PiP windows when zooming out
+                if use_pip then
+                    hide_all_pip_windows()
+                end
             else
                 log("Zooming in")
                 log(string.format("[DIAG] zoom_info.source_size=(%d,%d) zoom_value=%.1f sceneitem=%s source=%s",
@@ -1717,6 +2330,10 @@ function on_toggle_zoom(pressed)
                 -- Start magnifier character entrance animation
                 if use_magnifier_character then
                     start_magnifier_entrance()
+                end
+                -- Show PiP windows when zooming in
+                if use_pip then
+                    show_all_pip_windows()
                 end
             end
 
@@ -1852,6 +2469,11 @@ function on_timer()
             if use_magnifier_character then
                 update_magnifier_animation()
             end
+
+            -- Update PiP windows while zoomed in
+            if use_pip then
+                update_all_pip_windows()
+            end
         end
 
         if zoom_time >= 1 then
@@ -1873,11 +2495,15 @@ function on_timer()
                 if use_magnifier_character then
                     remove_magnifier()
                 end
+                -- Remove PiP windows when fully zoomed out
+                if use_pip then
+                    remove_all_pip_windows()
+                end
             elseif zoom_state == ZoomState.ZoomingIn then
                 log("Zoomed in")
                 zoom_state = ZoomState.ZoomedIn
-                -- Keep timer running if mouse tracking OR spotlight OR magnifier is active
-                should_stop_timer = (not use_auto_follow_mouse) and (not is_following_mouse) and (not (use_spotlight and is_spotlight_active)) and (not use_magnifier_character)
+                -- Keep timer running if mouse tracking OR spotlight OR magnifier OR PiP is active
+                should_stop_timer = (not use_auto_follow_mouse) and (not is_following_mouse) and (not (use_spotlight and is_spotlight_active)) and (not use_magnifier_character) and (not use_pip)
 
                 if use_auto_follow_mouse then
                     is_following_mouse = true
@@ -1926,6 +2552,16 @@ function on_transition_start(t)
         hide_magnifier()
         magnifier_character_sceneitem = nil
     end
+    -- Clean up PiP windows before transition
+    for i = 1, PIP_MAX_WINDOWS do
+        local window = pip_windows[i]
+        if window.sceneitem ~= nil then
+            window.sceneitem = nil
+        end
+        if window.border_sceneitem ~= nil then
+            window.border_sceneitem = nil
+        end
+    end
     release_sceneitem()
 end
 
@@ -1953,6 +2589,18 @@ function on_frontend_event(event)
                 obs.obs_sceneitem_set_visible(magnifier_character_sceneitem, true)
             end
             magnifier_anim_state = MagnifierAnimState.Visible
+        end
+        -- Re-add PiP windows to new scene if we're zoomed in
+        if zoom_state == ZoomState.ZoomedIn and use_pip then
+            for i = 1, PIP_MAX_WINDOWS do
+                local window = pip_windows[i]
+                if window.enabled and window.source ~= nil then
+                    add_pip_to_scene(window)
+                    if window.is_visible then
+                        show_pip_window(window)
+                    end
+                end
+            end
         end
     end
 end
@@ -2158,6 +2806,85 @@ function script_properties()
     obs.obs_property_list_add_string(magnifier_entry, "From Bottom", "bottom")
     obs.obs_property_set_long_description(magnifier_entry, "Direction from which the character enters")
 
+    -- Picture-in-Picture section
+    obs.obs_properties_add_text(props, "pip_header", "--- Picture-in-Picture ---", obs.OBS_TEXT_INFO)
+
+    local pip_enable = obs.obs_properties_add_bool(props, "use_pip", "Enable Picture-in-Picture")
+    obs.obs_property_set_long_description(pip_enable,
+        "Show magnified PiP windows when zoomed in")
+
+    -- PiP Window 1
+    obs.obs_properties_add_text(props, "pip1_header", "PiP Window 1", obs.OBS_TEXT_INFO)
+
+    local pip1_enabled = obs.obs_properties_add_bool(props, "pip1_enabled", "Enable Window 1")
+
+    local pip1_mode = obs.obs_properties_add_list(props, "pip1_mode", "Mode", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_INT)
+    obs.obs_property_list_add_int(pip1_mode, "Follow Mouse", 1)
+    obs.obs_property_list_add_int(pip1_mode, "Fixed Region", 2)
+
+    local pip1_position = obs.obs_properties_add_list(props, "pip1_position", "Display Position", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_INT)
+    obs.obs_property_list_add_int(pip1_position, "Top Left", 1)
+    obs.obs_property_list_add_int(pip1_position, "Top Center", 2)
+    obs.obs_property_list_add_int(pip1_position, "Top Right", 3)
+    obs.obs_property_list_add_int(pip1_position, "Middle Left", 4)
+    obs.obs_property_list_add_int(pip1_position, "Middle Right", 5)
+    obs.obs_property_list_add_int(pip1_position, "Bottom Left", 6)
+    obs.obs_property_list_add_int(pip1_position, "Bottom Center", 7)
+    obs.obs_property_list_add_int(pip1_position, "Bottom Right", 8)
+
+    local pip1_zoom = obs.obs_properties_add_float_slider(props, "pip1_zoom", "Zoom Factor", 1.5, 5, 0.5)
+    local pip1_width = obs.obs_properties_add_int(props, "pip1_width", "Display Width", 100, 800, 10)
+    local pip1_height = obs.obs_properties_add_int(props, "pip1_height", "Display Height", 100, 600, 10)
+    local pip1_border = obs.obs_properties_add_bool(props, "pip1_border", "Show Border")
+
+    -- PiP Window 2
+    obs.obs_properties_add_text(props, "pip2_header", "PiP Window 2", obs.OBS_TEXT_INFO)
+
+    local pip2_enabled = obs.obs_properties_add_bool(props, "pip2_enabled", "Enable Window 2")
+
+    local pip2_mode = obs.obs_properties_add_list(props, "pip2_mode", "Mode", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_INT)
+    obs.obs_property_list_add_int(pip2_mode, "Follow Mouse", 1)
+    obs.obs_property_list_add_int(pip2_mode, "Fixed Region", 2)
+
+    local pip2_position = obs.obs_properties_add_list(props, "pip2_position", "Display Position", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_INT)
+    obs.obs_property_list_add_int(pip2_position, "Top Left", 1)
+    obs.obs_property_list_add_int(pip2_position, "Top Center", 2)
+    obs.obs_property_list_add_int(pip2_position, "Top Right", 3)
+    obs.obs_property_list_add_int(pip2_position, "Middle Left", 4)
+    obs.obs_property_list_add_int(pip2_position, "Middle Right", 5)
+    obs.obs_property_list_add_int(pip2_position, "Bottom Left", 6)
+    obs.obs_property_list_add_int(pip2_position, "Bottom Center", 7)
+    obs.obs_property_list_add_int(pip2_position, "Bottom Right", 8)
+
+    local pip2_zoom = obs.obs_properties_add_float_slider(props, "pip2_zoom", "Zoom Factor", 1.5, 5, 0.5)
+    local pip2_width = obs.obs_properties_add_int(props, "pip2_width", "Display Width", 100, 800, 10)
+    local pip2_height = obs.obs_properties_add_int(props, "pip2_height", "Display Height", 100, 600, 10)
+    local pip2_border = obs.obs_properties_add_bool(props, "pip2_border", "Show Border")
+
+    -- PiP Window 3
+    obs.obs_properties_add_text(props, "pip3_header", "PiP Window 3", obs.OBS_TEXT_INFO)
+
+    local pip3_enabled = obs.obs_properties_add_bool(props, "pip3_enabled", "Enable Window 3")
+
+    local pip3_mode = obs.obs_properties_add_list(props, "pip3_mode", "Mode", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_INT)
+    obs.obs_property_list_add_int(pip3_mode, "Follow Mouse", 1)
+    obs.obs_property_list_add_int(pip3_mode, "Fixed Region", 2)
+
+    local pip3_position = obs.obs_properties_add_list(props, "pip3_position", "Display Position", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_INT)
+    obs.obs_property_list_add_int(pip3_position, "Top Left", 1)
+    obs.obs_property_list_add_int(pip3_position, "Top Center", 2)
+    obs.obs_property_list_add_int(pip3_position, "Top Right", 3)
+    obs.obs_property_list_add_int(pip3_position, "Middle Left", 4)
+    obs.obs_property_list_add_int(pip3_position, "Middle Right", 5)
+    obs.obs_property_list_add_int(pip3_position, "Bottom Left", 6)
+    obs.obs_property_list_add_int(pip3_position, "Bottom Center", 7)
+    obs.obs_property_list_add_int(pip3_position, "Bottom Right", 8)
+
+    local pip3_zoom = obs.obs_properties_add_float_slider(props, "pip3_zoom", "Zoom Factor", 1.5, 5, 0.5)
+    local pip3_width = obs.obs_properties_add_int(props, "pip3_width", "Display Width", 100, 800, 10)
+    local pip3_height = obs.obs_properties_add_int(props, "pip3_height", "Display Height", 100, 600, 10)
+    local pip3_border = obs.obs_properties_add_bool(props, "pip3_border", "Show Border")
+
     -- Source settings
     local allow_all = obs.obs_properties_add_bool(props, "allow_all_sources", "Allow any zoom source")
 
@@ -2224,6 +2951,19 @@ function script_load(settings)
     hotkey_spotlight_id = obs.obs_hotkey_register_frontend("toggle_spotlight_hotkey", "Toggle spotlight during zoom",
         on_toggle_spotlight)
 
+    -- Register PiP hotkeys
+    for i = 1, PIP_MAX_WINDOWS do
+        pip_hotkey_toggle[i] = obs.obs_hotkey_register_frontend(
+            "toggle_pip_window_" .. i,
+            "Toggle PiP Window " .. i,
+            create_pip_toggle_callback(i))
+        pip_hotkey_lock[i] = obs.obs_hotkey_register_frontend(
+            "lock_pip_window_" .. i,
+            "Lock PiP Window " .. i,
+            create_pip_lock_callback(i))
+    end
+    pip_hotkey_all = obs.obs_hotkey_register_frontend("toggle_all_pip", "Toggle All PiP Windows", on_toggle_all_pip)
+
     -- Load hotkey bindings
     local hotkey_save_array = obs.obs_data_get_array(settings, "obs_mouse_zoom.hotkey.zoom")
     obs.obs_hotkey_load(hotkey_zoom_id, hotkey_save_array)
@@ -2235,6 +2975,26 @@ function script_load(settings)
 
     hotkey_save_array = obs.obs_data_get_array(settings, "obs_mouse_zoom.hotkey.spotlight")
     obs.obs_hotkey_load(hotkey_spotlight_id, hotkey_save_array)
+    obs.obs_data_array_release(hotkey_save_array)
+
+    -- Load PiP hotkey bindings
+    for i = 1, PIP_MAX_WINDOWS do
+        hotkey_save_array = obs.obs_data_get_array(settings, "obs_mouse_zoom.hotkey.pip_toggle_" .. i)
+        if pip_hotkey_toggle[i] then
+            obs.obs_hotkey_load(pip_hotkey_toggle[i], hotkey_save_array)
+        end
+        obs.obs_data_array_release(hotkey_save_array)
+
+        hotkey_save_array = obs.obs_data_get_array(settings, "obs_mouse_zoom.hotkey.pip_lock_" .. i)
+        if pip_hotkey_lock[i] then
+            obs.obs_hotkey_load(pip_hotkey_lock[i], hotkey_save_array)
+        end
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+    hotkey_save_array = obs.obs_data_get_array(settings, "obs_mouse_zoom.hotkey.pip_all")
+    if pip_hotkey_all then
+        obs.obs_hotkey_load(pip_hotkey_all, hotkey_save_array)
+    end
     obs.obs_data_array_release(hotkey_save_array)
 
     -- Load settings
@@ -2262,6 +3022,22 @@ function script_load(settings)
     character_anchor_x = obs.obs_data_get_int(settings, "character_anchor_x")
     character_anchor_y = obs.obs_data_get_int(settings, "character_anchor_y")
     magnifier_entry_direction = obs.obs_data_get_string(settings, "magnifier_entry_direction")
+
+    -- Load PiP settings
+    use_pip = obs.obs_data_get_bool(settings, "use_pip")
+    for i = 1, PIP_MAX_WINDOWS do
+        local window = pip_windows[i]
+        local prefix = "pip" .. i .. "_"
+        window.enabled = obs.obs_data_get_bool(settings, prefix .. "enabled")
+        window.mode = obs.obs_data_get_int(settings, prefix .. "mode")
+        window.display_position = obs.obs_data_get_int(settings, prefix .. "position")
+        window.zoom_factor = obs.obs_data_get_double(settings, prefix .. "zoom")
+        window.display_width = obs.obs_data_get_int(settings, prefix .. "width")
+        window.display_height = obs.obs_data_get_int(settings, prefix .. "height")
+        window.border_enabled = obs.obs_data_get_bool(settings, prefix .. "border")
+        window.source_width = window.display_width * window.zoom_factor
+        window.source_height = window.display_height * window.zoom_factor
+    end
 
     allow_all_sources = obs.obs_data_get_bool(settings, "allow_all_sources")
     use_monitor_override = obs.obs_data_get_bool(settings, "use_monitor_override")
@@ -2305,6 +3081,7 @@ function script_unload()
     remove_vignette_filter()
     remove_spotlight()
     remove_magnifier()
+    remove_all_pip_windows()
 
     if major > 29.0 then
         local transitions = obs.obs_frontend_get_transitions()
@@ -2354,6 +3131,36 @@ function script_defaults(settings)
     obs.obs_data_set_default_int(settings, "character_anchor_y", 0)
     obs.obs_data_set_default_string(settings, "magnifier_entry_direction", "right")
 
+    -- PiP defaults
+    obs.obs_data_set_default_bool(settings, "use_pip", false)
+
+    -- PiP Window 1 defaults
+    obs.obs_data_set_default_bool(settings, "pip1_enabled", true)
+    obs.obs_data_set_default_int(settings, "pip1_mode", 1)
+    obs.obs_data_set_default_int(settings, "pip1_position", 3)  -- Top Right
+    obs.obs_data_set_default_double(settings, "pip1_zoom", 2.5)
+    obs.obs_data_set_default_int(settings, "pip1_width", 320)
+    obs.obs_data_set_default_int(settings, "pip1_height", 240)
+    obs.obs_data_set_default_bool(settings, "pip1_border", true)
+
+    -- PiP Window 2 defaults
+    obs.obs_data_set_default_bool(settings, "pip2_enabled", false)
+    obs.obs_data_set_default_int(settings, "pip2_mode", 1)
+    obs.obs_data_set_default_int(settings, "pip2_position", 6)  -- Bottom Left
+    obs.obs_data_set_default_double(settings, "pip2_zoom", 2.0)
+    obs.obs_data_set_default_int(settings, "pip2_width", 320)
+    obs.obs_data_set_default_int(settings, "pip2_height", 240)
+    obs.obs_data_set_default_bool(settings, "pip2_border", true)
+
+    -- PiP Window 3 defaults
+    obs.obs_data_set_default_bool(settings, "pip3_enabled", false)
+    obs.obs_data_set_default_int(settings, "pip3_mode", 1)
+    obs.obs_data_set_default_int(settings, "pip3_position", 8)  -- Bottom Right
+    obs.obs_data_set_default_double(settings, "pip3_zoom", 2.0)
+    obs.obs_data_set_default_int(settings, "pip3_width", 320)
+    obs.obs_data_set_default_int(settings, "pip3_height", 240)
+    obs.obs_data_set_default_bool(settings, "pip3_border", true)
+
     obs.obs_data_set_default_bool(settings, "allow_all_sources", false)
     obs.obs_data_set_default_bool(settings, "use_monitor_override", false)
     obs.obs_data_set_default_int(settings, "monitor_override_x", 0)
@@ -2383,6 +3190,25 @@ function script_save(settings)
     if hotkey_spotlight_id ~= nil then
         local hotkey_save_array = obs.obs_hotkey_save(hotkey_spotlight_id)
         obs.obs_data_set_array(settings, "obs_mouse_zoom.hotkey.spotlight", hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+
+    -- Save PiP hotkey bindings
+    for i = 1, PIP_MAX_WINDOWS do
+        if pip_hotkey_toggle[i] then
+            local hotkey_save_array = obs.obs_hotkey_save(pip_hotkey_toggle[i])
+            obs.obs_data_set_array(settings, "obs_mouse_zoom.hotkey.pip_toggle_" .. i, hotkey_save_array)
+            obs.obs_data_array_release(hotkey_save_array)
+        end
+        if pip_hotkey_lock[i] then
+            local hotkey_save_array = obs.obs_hotkey_save(pip_hotkey_lock[i])
+            obs.obs_data_set_array(settings, "obs_mouse_zoom.hotkey.pip_lock_" .. i, hotkey_save_array)
+            obs.obs_data_array_release(hotkey_save_array)
+        end
+    end
+    if pip_hotkey_all then
+        local hotkey_save_array = obs.obs_hotkey_save(pip_hotkey_all)
+        obs.obs_data_set_array(settings, "obs_mouse_zoom.hotkey.pip_all", hotkey_save_array)
         obs.obs_data_array_release(hotkey_save_array)
     end
 end
@@ -2424,6 +3250,27 @@ function script_update(settings)
     character_anchor_x = obs.obs_data_get_int(settings, "character_anchor_x")
     character_anchor_y = obs.obs_data_get_int(settings, "character_anchor_y")
     magnifier_entry_direction = obs.obs_data_get_string(settings, "magnifier_entry_direction")
+
+    -- PiP settings
+    use_pip = obs.obs_data_get_bool(settings, "use_pip")
+
+    -- Load PiP window settings
+    for i = 1, PIP_MAX_WINDOWS do
+        local window = pip_windows[i]
+        local prefix = "pip" .. i .. "_"
+
+        window.enabled = obs.obs_data_get_bool(settings, prefix .. "enabled")
+        window.mode = obs.obs_data_get_int(settings, prefix .. "mode")
+        window.display_position = obs.obs_data_get_int(settings, prefix .. "position")
+        window.zoom_factor = obs.obs_data_get_double(settings, prefix .. "zoom")
+        window.display_width = obs.obs_data_get_int(settings, prefix .. "width")
+        window.display_height = obs.obs_data_get_int(settings, prefix .. "height")
+        window.border_enabled = obs.obs_data_get_bool(settings, prefix .. "border")
+
+        -- Calculate source region based on display size and zoom
+        window.source_width = window.display_width * window.zoom_factor
+        window.source_height = window.display_height * window.zoom_factor
+    end
 
     allow_all_sources = obs.obs_data_get_bool(settings, "allow_all_sources")
     use_monitor_override = obs.obs_data_get_bool(settings, "use_monitor_override")
