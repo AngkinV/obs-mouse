@@ -167,6 +167,8 @@ local function create_default_pip_config(id)
         source_y = 0,
         source_width = 400,
         source_height = 300,
+        source_offset_x = 0,   -- Offset from mouse position (FollowMouse mode)
+        source_offset_y = 0,
 
         -- Display settings
         display_position = PiPPosition.TopRight,
@@ -1566,7 +1568,11 @@ function update_pip_crop(window)
         local source_mouse_x = (mouse.x - monitor_x) * sx
         local source_mouse_y = (mouse.y - monitor_y) * sy
 
-        -- Center the source region on mouse
+        -- Apply offset from settings (allows each window to show different areas)
+        source_mouse_x = source_mouse_x + window.source_offset_x
+        source_mouse_y = source_mouse_y + window.source_offset_y
+
+        -- Center the source region on the offset mouse position
         local half_w = window.source_width / 2
         local half_h = window.source_height / 2
 
@@ -2835,6 +2841,17 @@ function script_properties()
     local pip1_zoom = obs.obs_properties_add_float_slider(props, "pip1_zoom", "Zoom Factor", 1.5, 5, 0.5)
     local pip1_width = obs.obs_properties_add_int(props, "pip1_width", "Display Width", 100, 800, 10)
     local pip1_height = obs.obs_properties_add_int(props, "pip1_height", "Display Height", 100, 600, 10)
+
+    local pip1_offset_x = obs.obs_properties_add_int(props, "pip1_offset_x", "Offset X (Follow Mouse)", -5000, 5000, 50)
+    obs.obs_property_set_long_description(pip1_offset_x, "Horizontal offset from mouse position (pixels in source coordinates)")
+    local pip1_offset_y = obs.obs_properties_add_int(props, "pip1_offset_y", "Offset Y (Follow Mouse)", -5000, 5000, 50)
+    obs.obs_property_set_long_description(pip1_offset_y, "Vertical offset from mouse position (pixels in source coordinates)")
+
+    local pip1_source_x = obs.obs_properties_add_int(props, "pip1_source_x", "Source X (Fixed Region)", 0, 10000, 10)
+    obs.obs_property_set_long_description(pip1_source_x, "X position of the fixed region to monitor")
+    local pip1_source_y = obs.obs_properties_add_int(props, "pip1_source_y", "Source Y (Fixed Region)", 0, 10000, 10)
+    obs.obs_property_set_long_description(pip1_source_y, "Y position of the fixed region to monitor")
+
     local pip1_border = obs.obs_properties_add_bool(props, "pip1_border", "Show Border")
 
     -- PiP Window 2
@@ -2859,6 +2876,17 @@ function script_properties()
     local pip2_zoom = obs.obs_properties_add_float_slider(props, "pip2_zoom", "Zoom Factor", 1.5, 5, 0.5)
     local pip2_width = obs.obs_properties_add_int(props, "pip2_width", "Display Width", 100, 800, 10)
     local pip2_height = obs.obs_properties_add_int(props, "pip2_height", "Display Height", 100, 600, 10)
+
+    local pip2_offset_x = obs.obs_properties_add_int(props, "pip2_offset_x", "Offset X (Follow Mouse)", -5000, 5000, 50)
+    obs.obs_property_set_long_description(pip2_offset_x, "Horizontal offset from mouse position (pixels in source coordinates)")
+    local pip2_offset_y = obs.obs_properties_add_int(props, "pip2_offset_y", "Offset Y (Follow Mouse)", -5000, 5000, 50)
+    obs.obs_property_set_long_description(pip2_offset_y, "Vertical offset from mouse position (pixels in source coordinates)")
+
+    local pip2_source_x = obs.obs_properties_add_int(props, "pip2_source_x", "Source X (Fixed Region)", 0, 10000, 10)
+    obs.obs_property_set_long_description(pip2_source_x, "X position of the fixed region to monitor")
+    local pip2_source_y = obs.obs_properties_add_int(props, "pip2_source_y", "Source Y (Fixed Region)", 0, 10000, 10)
+    obs.obs_property_set_long_description(pip2_source_y, "Y position of the fixed region to monitor")
+
     local pip2_border = obs.obs_properties_add_bool(props, "pip2_border", "Show Border")
 
     -- PiP Window 3
@@ -2883,6 +2911,17 @@ function script_properties()
     local pip3_zoom = obs.obs_properties_add_float_slider(props, "pip3_zoom", "Zoom Factor", 1.5, 5, 0.5)
     local pip3_width = obs.obs_properties_add_int(props, "pip3_width", "Display Width", 100, 800, 10)
     local pip3_height = obs.obs_properties_add_int(props, "pip3_height", "Display Height", 100, 600, 10)
+
+    local pip3_offset_x = obs.obs_properties_add_int(props, "pip3_offset_x", "Offset X (Follow Mouse)", -5000, 5000, 50)
+    obs.obs_property_set_long_description(pip3_offset_x, "Horizontal offset from mouse position (pixels in source coordinates)")
+    local pip3_offset_y = obs.obs_properties_add_int(props, "pip3_offset_y", "Offset Y (Follow Mouse)", -5000, 5000, 50)
+    obs.obs_property_set_long_description(pip3_offset_y, "Vertical offset from mouse position (pixels in source coordinates)")
+
+    local pip3_source_x = obs.obs_properties_add_int(props, "pip3_source_x", "Source X (Fixed Region)", 0, 10000, 10)
+    obs.obs_property_set_long_description(pip3_source_x, "X position of the fixed region to monitor")
+    local pip3_source_y = obs.obs_properties_add_int(props, "pip3_source_y", "Source Y (Fixed Region)", 0, 10000, 10)
+    obs.obs_property_set_long_description(pip3_source_y, "Y position of the fixed region to monitor")
+
     local pip3_border = obs.obs_properties_add_bool(props, "pip3_border", "Show Border")
 
     -- Source settings
@@ -3035,6 +3074,10 @@ function script_load(settings)
         window.display_width = obs.obs_data_get_int(settings, prefix .. "width")
         window.display_height = obs.obs_data_get_int(settings, prefix .. "height")
         window.border_enabled = obs.obs_data_get_bool(settings, prefix .. "border")
+        window.source_offset_x = obs.obs_data_get_int(settings, prefix .. "offset_x")
+        window.source_offset_y = obs.obs_data_get_int(settings, prefix .. "offset_y")
+        window.source_x = obs.obs_data_get_int(settings, prefix .. "source_x")
+        window.source_y = obs.obs_data_get_int(settings, prefix .. "source_y")
         window.source_width = window.display_width * window.zoom_factor
         window.source_height = window.display_height * window.zoom_factor
     end
@@ -3141,24 +3184,36 @@ function script_defaults(settings)
     obs.obs_data_set_default_double(settings, "pip1_zoom", 2.5)
     obs.obs_data_set_default_int(settings, "pip1_width", 320)
     obs.obs_data_set_default_int(settings, "pip1_height", 240)
+    obs.obs_data_set_default_int(settings, "pip1_offset_x", 0)
+    obs.obs_data_set_default_int(settings, "pip1_offset_y", 0)
+    obs.obs_data_set_default_int(settings, "pip1_source_x", 0)
+    obs.obs_data_set_default_int(settings, "pip1_source_y", 0)
     obs.obs_data_set_default_bool(settings, "pip1_border", true)
 
-    -- PiP Window 2 defaults
+    -- PiP Window 2 defaults (offset to the right of mouse)
     obs.obs_data_set_default_bool(settings, "pip2_enabled", false)
     obs.obs_data_set_default_int(settings, "pip2_mode", 1)
     obs.obs_data_set_default_int(settings, "pip2_position", 6)  -- Bottom Left
     obs.obs_data_set_default_double(settings, "pip2_zoom", 2.0)
     obs.obs_data_set_default_int(settings, "pip2_width", 320)
     obs.obs_data_set_default_int(settings, "pip2_height", 240)
+    obs.obs_data_set_default_int(settings, "pip2_offset_x", 500)
+    obs.obs_data_set_default_int(settings, "pip2_offset_y", 0)
+    obs.obs_data_set_default_int(settings, "pip2_source_x", 0)
+    obs.obs_data_set_default_int(settings, "pip2_source_y", 0)
     obs.obs_data_set_default_bool(settings, "pip2_border", true)
 
-    -- PiP Window 3 defaults
+    -- PiP Window 3 defaults (offset below mouse)
     obs.obs_data_set_default_bool(settings, "pip3_enabled", false)
     obs.obs_data_set_default_int(settings, "pip3_mode", 1)
     obs.obs_data_set_default_int(settings, "pip3_position", 8)  -- Bottom Right
     obs.obs_data_set_default_double(settings, "pip3_zoom", 2.0)
     obs.obs_data_set_default_int(settings, "pip3_width", 320)
     obs.obs_data_set_default_int(settings, "pip3_height", 240)
+    obs.obs_data_set_default_int(settings, "pip3_offset_x", 0)
+    obs.obs_data_set_default_int(settings, "pip3_offset_y", 500)
+    obs.obs_data_set_default_int(settings, "pip3_source_x", 0)
+    obs.obs_data_set_default_int(settings, "pip3_source_y", 0)
     obs.obs_data_set_default_bool(settings, "pip3_border", true)
 
     obs.obs_data_set_default_bool(settings, "allow_all_sources", false)
@@ -3266,6 +3321,10 @@ function script_update(settings)
         window.display_width = obs.obs_data_get_int(settings, prefix .. "width")
         window.display_height = obs.obs_data_get_int(settings, prefix .. "height")
         window.border_enabled = obs.obs_data_get_bool(settings, prefix .. "border")
+        window.source_offset_x = obs.obs_data_get_int(settings, prefix .. "offset_x")
+        window.source_offset_y = obs.obs_data_get_int(settings, prefix .. "offset_y")
+        window.source_x = obs.obs_data_get_int(settings, prefix .. "source_x")
+        window.source_y = obs.obs_data_get_int(settings, prefix .. "source_y")
 
         -- Calculate source region based on display size and zoom
         window.source_width = window.display_width * window.zoom_factor
